@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <link rel="stylesheet" type="text/css" href="styles.css">
+</head>
+<style>
+    nav {
+  position: fixed;
+  bottom: 0;
+  width: 100%;
+  background-color: #f8f8f8;
+  border-top: 1px solid #ccc;
+}
+
+nav ul {
+  display: flex;
+  justify-content: space-around;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+nav ul li {
+  flex-grow: 1;
+}
+
+nav ul li a {
+  display: block;
+  text-align: center;
+  padding: 10px 0;
+  color: #888;
+  text-decoration: none;
+  transition: color 0.3s;
+}
+
+nav ul li a.active {
+  color: #333;
+}
+
+</style>
+<body>
+  <nav>
+    <ul>
+      <li><a href="#" class="active">Home</a></li>
+      <li><a href="#">Search</a></li>
+      <li><a href="#">Notifications</a></li>
+      <li><a href="#">Profile</a></li>
+    </ul>
+  </nav>
+  
+  <!-- Your page content here -->
+  
+  <script>
+    // Add active class to clicked menu item
+    var navItems = document.querySelectorAll('nav ul li a');
+
+    navItems.forEach(function(item) {
+    item.addEventListener('click', function() {
+        navItems.forEach(function(item) {
+        item.classList.remove('active');
+        });
+        this.classList.add('active');
+    });
+    });
+
+  </script>
+</body>
+</html>
