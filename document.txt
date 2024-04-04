@@ -15,4 +15,5 @@
 
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 python -m venv myenv
+myenv\Scripts\activate
 git rm --cached -r myenv
