@@ -11,3 +11,7 @@
     background-color: lightgreen;
   }
 }
+
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+git rm --cached -r myenv
