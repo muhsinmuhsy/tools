@@ -16,4 +16,11 @@
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 python -m venv myenv
 myenv\Scripts\activate
-git rm --cached -r myenv
+
+## used to remove a directory (or file) named myenv from the Git index without deleting it from your working directory.
+git rm --cached -r myenv 
+
+
+git remote set-url <remote-name> <new-url>
+git remote set-url origin https://github.com/yourusername/your-repository.git
+git remote -v
