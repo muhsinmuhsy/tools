@@ -24,3 +24,7 @@ git rm --cached -r myenv
 git remote set-url <remote-name> <new-url>
 git remote set-url origin https://github.com/yourusername/your-repository.git
 git remote -v
+
+
+git log
+git checkout <logtoken>
