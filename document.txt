@@ -28,3 +28,15 @@ git remote -v
 
 git log
 git checkout <logtoken>
+
+
+# DATABASES = {
+#     "default": {
+#         "ENGINE": "django.db.backends.postgresql",
+#         "NAME": "job_portal_db",
+#         "USER": "postgres",
+#         "PASSWORD": "muhsy",
+#         "HOST": "127.0.0.1",
+#         "PORT": "5432",
+#     }
+# }
