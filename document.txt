@@ -42,3 +42,7 @@ git checkout <logtoken>
 #         "PORT": "5432",
 #     }
 # }
+
+##Redis
+sudo service redis-server status
+sudo service redis-server start
