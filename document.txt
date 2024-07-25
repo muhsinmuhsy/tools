@@ -27,6 +27,10 @@ git remote set-url <remote-name> <new-url>
 git remote set-url origin https://github.com/yourusername/your-repository.git
 git remote -v
 
+clone specific branch eg:development
+git clone -b development https://github.com/WSPLTD/DM-system.git
+
+
 
 git log
 git checkout <logtoken>
