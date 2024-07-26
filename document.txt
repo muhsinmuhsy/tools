@@ -50,3 +50,13 @@ git checkout <logtoken>
 ##Redis
 sudo service redis-server status
 sudo service redis-server start
+
+
+#generate django secrete key
+import secrets
+
+def generate_secret_key():
+    return secrets.token_urlsafe(50)  # Generates a 50-character random key
+
+print(generate_secret_key())
+
