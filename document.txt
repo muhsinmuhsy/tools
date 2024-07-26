@@ -56,7 +56,7 @@ sudo service redis-server start
 import secrets
 
 def generate_secret_key():
-    return secrets.token_urlsafe(50)  # Generates a 50-character random key
+    return secrets.token_urlsafe(50)
 
 print(generate_secret_key())
 
