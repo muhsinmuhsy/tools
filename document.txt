@@ -75,3 +75,8 @@ send_mail(
 )
 
 
+
+#celery
+celery -A dm_system  worker --pool=solo -l info
+celery -A dm_system beat --loglevel=info
+
