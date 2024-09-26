@@ -88,3 +88,12 @@ EMAIL_HOST_PASSWORD = 'yetedrvecukmvzgm'
 celery -A dm_system  worker --pool=solo -l info
 celery -A dm_system beat --loglevel=info
 
+
+# name of the model in shell
+from cafe_entrepreneurship.models import FsBranchDecisionStatus
+
+# Get the model name
+model_name = FsBranchDecisionStatus._meta.model_name
+print(model_name)  # This will print 'fsbranchdecisionstatus'
+
+
