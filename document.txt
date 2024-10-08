@@ -88,6 +88,8 @@ EMAIL_HOST_PASSWORD = 'yetedrvecukmvzgm'
 celery -A dm_system  worker --pool=solo -l info
 celery -A dm_system beat --loglevel=info
 
+celery -A clever_cafe worker --loglevel=info --pool=solo
+
 
 # name of the model in shell
 from cafe_entrepreneurship.models import FsBranchDecisionStatus
