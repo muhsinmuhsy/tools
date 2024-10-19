@@ -1,0 +1,15 @@
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": "redis://127.0.0.1:6379",
+    }
+}
+
+from django.core.cache import cache
+
+# Set cache
+cache.set('my_key', 'my_value', timeout=60)  # Timeout is in seconds
+
+# Get from cache
+value = cache.get('my_key')
+print(value)  # Should print 'my_value' if cached successfully
