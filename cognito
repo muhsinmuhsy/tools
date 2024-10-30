@@ -1,0 +1,971 @@
+#$ Cognito
+AWS_COGNITO_ACCESS_KEY_ID = env('AWS_COGNITO_ACCESS_KEY_ID')
+AWS_COGNITO_SECRET_ACCESS_KEY = env('AWS_COGNITO_SECRET_ACCESS_KEY')
+AWS_COGNITO_CLIENT_ID = env('AWS_COGNITO_CLIENT_ID')
+AWS_COGNITO_CLIENT_SECRET = env('AWS_COGNITO_CLIENT_SECRET')
+AWS_COGNITO_POOL_ID = env('AWS_COGNITO_POOL_ID')
+AWS_COGNITO_REGION = env('AWS_COGNITO_REGION')
+
+##################################################################################################################################################################################
+
+
+import base64
+import hmac
+import hashlib
+import boto3
+from django.conf import settings
+
+class CognitoClient:
+    def __init__(self):
+        self.client = boto3.client('cognito-idp', 
+                                    aws_access_key_id=settings.AWS_COGNITO_ACCESS_KEY_ID,
+                                    aws_secret_access_key=settings.AWS_COGNITO_SECRET_ACCESS_KEY,
+                                    region_name=settings.AWS_COGNITO_REGION)
+        self.client_id = settings.AWS_COGNITO_CLIENT_ID
+        self.client_secret = settings.AWS_COGNITO_CLIENT_SECRET
+
+    def get_secret_hash(self, username):
+        message = username + self.client_id
+        dig = hmac.new(
+            self.client_secret.encode('utf-8'),
+            message.encode('utf-8'),
+            hashlib.sha256
+        ).digest()
+        return base64.b64encode(dig).decode()
+
+    def sign_up(self, username, password, email):
+        secret_hash = self.get_secret_hash(username)
+        response = self.client.sign_up(
+            ClientId=self.client_id,
+            Username=username,
+            Password=password,
+            UserAttributes=[
+                {
+                    'Name': 'email',
+                    'Value': email
+                },
+            ],
+            SecretHash=secret_hash
+        )
+        return response
+
+    def confirm_sign_up(self, username, confirmation_code):
+        secret_hash = self.get_secret_hash(username)
+        response = self.client.confirm_sign_up(
+            ClientId=self.client_id,
+            Username=username,
+            ConfirmationCode=confirmation_code,
+            SecretHash=secret_hash
+        )
+        return response
+    
+    def resend_confirmation_code(self, username):
+        """
+        Resend the confirmation code for an unconfirmed user.
+        """
+        secret_hash = self.get_secret_hash(username)
+        response = self.client.resend_confirmation_code(
+            ClientId=self.client_id,
+            Username=username,
+            SecretHash=secret_hash
+        )
+        return response
+
+
+    def sign_in(self, username, password):
+        secret_hash = self.get_secret_hash(username)
+        response = self.client.admin_initiate_auth(
+            UserPoolId=settings.AWS_COGNITO_POOL_ID,
+            ClientId=self.client_id,
+            AuthFlow='ADMIN_NO_SRP_AUTH',
+            AuthParameters={
+                'USERNAME': username,
+                'PASSWORD': password,
+                'SECRET_HASH': secret_hash
+            }
+        )
+        return response
+    
+    
+    def check_user_in_cognito(self, username):
+        try:
+            self.client.admin_get_user(
+                UserPoolId=settings.AWS_COGNITO_POOL_ID,
+                Username=username
+            )
+            return True  # User exists
+        except self.client.exceptions.UserNotFoundException:
+            return False  # User is deleted
+
+    def delete_user(self, username):
+        """
+        Delete a user from Cognito.
+        """
+        try:
+            self.client.admin_delete_user(
+                UserPoolId=settings.AWS_COGNITO_POOL_ID,
+                Username=username
+            )
+            return True  # User deleted successfully
+        except Exception as e:
+            # Log the exception or handle it accordingly
+            print(f"Error deleting user {username} from Cognito: {str(e)}")
+            return False  # Deletion failed
+
+
+############################################################################################################################################################################
+
+     
+class CognitoAuthentication(BaseAuthentication):
+    def authenticate(self, request):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return None
+
+        try:
+            token_type, token = auth_header.split()
+            if token_type.lower() != 'bearer':
+                raise AuthenticationFailed('Authorization header must start with Bearer')
+
+            # JWKS URL
+            jwks_url = f'https://cognito-idp.{settings.AWS_COGNITO_REGION}.amazonaws.com/{settings.AWS_COGNITO_POOL_ID}/.well-known/jwks.json'
+            jwks_client = PyJWKClient(jwks_url)
+            public_key = jwks_client.get_signing_key_from_jwt(token).key
+
+            # Decode the JWT token using the public key
+            decoded_token = jwt.decode(
+                token,
+                public_key,
+                algorithms=['RS256'],
+                audience=settings.AWS_COGNITO_CLIENT_ID,
+                issuer=f'https://cognito-idp.{settings.AWS_COGNITO_REGION}.amazonaws.com/{settings.AWS_COGNITO_POOL_ID}'
+            )
+
+            user_id = decoded_token.get('sub')
+            if user_id:
+                return (user_id, token)
+            else:
+                raise AuthenticationFailed('Invalid token')
+
+        except jwt.ExpiredSignatureError:
+            raise AuthenticationFailed('Token has expired')
+        except jwt.InvalidTokenError as e:
+            raise AuthenticationFailed(f'Invalid token claims: {str(e)}')
+        except Exception as e:
+            raise AuthenticationFailed(f'Authentication error: {str(e)}')
+
+###################################################################################################################################################################
+
+import logging
+from ..serializers import (
+    ChangePasswordSerializer, ProfilePictureUpdateSerializer
+)
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
+from django.utils import timezone
+from datetime import timedelta
+from ..models import User, UserProfile
+from rest_framework_simplejwt.tokens import RefreshToken
+from ..tokens import custom_refresh
+import random
+from django.contrib.auth import authenticate, login
+from rest_framework.permissions import IsAuthenticated
+from auth_manager.permissions import IsCafeEntrepreneurshipUser
+from django.core.validators import validate_email
+from django.core.exceptions import ValidationError
+from django.db import transaction, IntegrityError
+from services.email import send_custom_email
+from cafe_entrepreneurship.models import(
+    Branch as CeBranch, EmailNotificationStatus as CeEmailNotificationStatus
+)
+from common_data.models import State
+import uuid
+from django.core.mail import EmailMultiAlternatives
+from django.template.loader import render_to_string
+from services.utils import validate_list_ids
+from ..cognito import CognitoClient
+import uuid
+from django.utils.translation import gettext_lazy as _
+import re
+from botocore.exceptions import ClientError
+from django.conf import settings
+import base64
+
+# Instantiate Cognito client
+cognito_client = CognitoClient()
+
+logger = logging.getLogger(__name__)
+
+################################################### Cafe Entrepreneurship Register #############################################################
+
+def is_valid_username(username):
+    pattern = r'^[\w._-]+$' 
+    return re.match(pattern, username) is not None
+
+def is_valid_email(email):
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    return re.match(pattern, email) is not None
+
+class CeUserRegisterView(APIView):
+    def post(self, request, format=None):
+        try:
+            with transaction.atomic():
+                # Validate required fields
+                required_fields = ['username', 'email', 'contact_number', 'password', 'first_name', 'last_name', 'state', 'post_code', 'operational_status', 'subscription_type']
+                missing_fields = [field for field in required_fields if field not in request.data]
+                if missing_fields:
+                    return Response({"error": f"Missing required fields: {', '.join(missing_fields)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+                username = request.data.get('username')
+                email = request.data.get('email')
+                email2 = request.data.get('email2')
+                contact_number = request.data.get('contact_number')
+                password = request.data.get('password')
+                password2 = request.data.get('password2')
+                first_name = request.data.get('first_name')
+                last_name = request.data.get('last_name')
+                state = request.data.get('state')
+                post_code = request.data.get('post_code')
+                operational_status_ids = request.data.get('operational_status', [])
+                subscription_type = request.data.get('subscription_type')
+                
+                # Validate username and operational status
+                if not is_valid_username(username):
+                    return Response({"error": "Username contains invalid characters."}, status=status.HTTP_400_BAD_REQUEST)
+
+                is_valid, error_message = validate_list_ids(operational_status_ids, 'operational_status')
+                if not is_valid:
+                    return Response({'error': error_message}, status=status.HTTP_400_BAD_REQUEST)
+
+                # Delete unverified users
+                # expiration_time = timezone.now() - timedelta(hours=1)
+                # users_to_delete = User.objects.filter(is_verified=False, user_registered_at__lt=expiration_time).exclude(is_superuser=True)
+
+                # for user in users_to_delete:
+                #     try:
+                #         cognito_client.delete_user(user.username)
+                #         user.delete()
+                #         logger.info(f"Deleted user {user.username} from both Django and Cognito.")
+                #     except ClientError as e:
+                #         logger.error(f"Cognito error during user deletion: {str(e)} for user {user.username}")
+                #     except Exception as e:
+                #         logger.exception(f"Unexpected error during deletion of user {user.username}: {e}")
+
+                # Validate new user information
+                if username and User.objects.filter(username=username).exists():
+                    return Response({"error": "Username already exists."}, status=status.HTTP_400_BAD_REQUEST)
+
+                if email != email2:
+                    return Response({"error": "Email addresses must match."}, status=status.HTTP_400_BAD_REQUEST)
+
+                if password != password2:
+                    return Response({"error": "Passwords must match."}, status=status.HTTP_400_BAD_REQUEST)
+
+                if email and User.objects.filter(email=email).exists():
+                    return Response({"error": "Email already exists."}, status=status.HTTP_400_BAD_REQUEST)
+
+                # Sign up user in Cognito
+                try:
+                    cognito_sign_up = cognito_client.sign_up(username, password, email)
+                    cognito_sub = cognito_sign_up['UserSub']
+                    if not cognito_sub:
+                        raise ValueError("UserSub not found in Cognito response.")
+                except ClientError as e:
+                    logger.error(f"Cognito error during Cognito Signup: {str(e)}")
+                    return Response({"error": f"An error occurred during Cognito Signup: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+                temp_email = f"{uuid.uuid4().hex[:8]}_{email}"
+                
+                # Encrypt password
+                encoded_password = base64.b64encode(password.encode())
+                
+                # Create user in Django
+                user = User.objects.create_user(
+                    cognito_sub=cognito_sub,
+                    cognito_password=encoded_password,
+                    username=username,
+                    email=temp_email,
+                    contact_number=contact_number,
+                    password=password,
+                    is_cafe_entrepreneurship_user=True
+                )
+
+                # Create user profile
+                state_id = State.objects.get(id=state)
+                profile = UserProfile.objects.create(
+                    user=user,
+                    first_name=first_name,
+                    last_name=last_name,
+                    state=state_id,
+                    post_code=post_code
+                )
+
+                return Response({
+                    'user': {
+                        'id': user.id,
+                        'username': username,
+                        'email': email,
+                        'contact_number': user.contact_number,
+                    },
+                    'profile': {
+                        'first_name': profile.first_name,
+                        'last_name': profile.last_name,
+                        'state': str(profile.state),
+                        'post_code': profile.post_code,
+                    },
+                    'branch': {
+                        'operational_status': operational_status_ids,
+                        'subscription_type': subscription_type
+                    },
+                    'cognito_sign_up': cognito_sign_up
+                }, status=status.HTTP_201_CREATED)
+
+        except KeyError as key_error:
+            logger.error(f"Missing required field: {key_error}")
+            return Response({"error": f"Missing required field: {key_error}"}, status=status.HTTP_400_BAD_REQUEST)
+        except IntegrityError as integrity_error:
+            logger.error(f"Database integrity error: {integrity_error}")
+            return Response({"error": f"Database integrity error: {integrity_error}"}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred: {e}")
+            return Response({"error": f"An unexpected error occurred: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+################################################### Verify OTP #############################################################
+
+class CeVerifyEmailOTPView(APIView):
+    """
+    View to verify the email OTP for a user and create a corresponding branch.
+    """
+
+    def patch(self, request, user_id=None, format=None):
+        with transaction.atomic():
+            # Check for required fields
+            required_fields = ['otp', 'operational_status', 'subscription_type']
+            for field in required_fields:
+                if field not in request.data:
+                    return Response({"error": f"Missing required field: {field}"}, status=status.HTTP_400_BAD_REQUEST)
+
+            otp = request.data['otp']
+            operational_status_ids = request.data.get('operational_status', [])
+            subscription_type = request.data['subscription_type']
+
+            # Retrieve user and check permissions
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User does not exist.'}, status=status.HTTP_404_NOT_FOUND)
+
+            if not user.is_cafe_entrepreneurship_user:
+                return Response({"error": "This user does not have permission to access this process."}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Prepare to strip temporary email
+            remove_temp_email = user.email.split("_", 1)[-1]
+
+            if User.objects.filter(email=remove_temp_email).exists():
+                return Response({"error": "The email is already verified. Please check your email security settings."}, status=status.HTTP_400_BAD_REQUEST)
+
+            username = user.username
+
+            # Confirm OTP with Cognito
+            try:
+                cognito_confirm_otp = cognito_client.confirm_sign_up(username, otp)
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'CodeMismatchException':
+                    return Response({"error": "Invalid OTP provided."}, status=status.HTTP_400_BAD_REQUEST)
+                logger.error(f"Cognito error during OTP confirmation: {str(e)}")
+                return Response({"error": "An error occurred during OTP confirmation."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            except Exception as e:
+                logger.error(f"Cognito error during OTP confirmation: {str(e)}")
+                return Response({"error": f"An error occurred during OTP confirmation: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            # Update user with verified details
+            try:
+                user.email = remove_temp_email
+                user.is_active = True
+                user.email_otp = None
+                user.email_otp_created_at = None
+                user.email_verify = True
+                user.is_verified = True
+                user.save()
+            except Exception as e:
+                logger.error(f"Error updating user {user_id}: {str(e)}")
+                return Response({'error': f'Error updating user: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            # Create CeBranch for the user
+            try:
+                branch = CeBranch.objects.create(user=user, subscription_type=subscription_type)
+                if operational_status_ids:
+                    branch.operational_status.set(operational_status_ids)
+            except ValidationError as ve:
+                logger.error(f"Validation error for branch creation: {ve}")
+                return Response({'error': f'Invalid operational status IDs: {ve}'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Log email notification creation and send confirmation email
+            CeEmailNotificationStatus.objects.create(user=user)
+           
+            subject = 'Account Created Successfully'
+            message = 'Your account has been created successfully.'
+            send_custom_email([user.email], subject, message)
+
+            # Sign in the user with Cognito
+            try:
+                cognito_password = user.cognito_password
+                logger.debug(f'cognito_password (raw bytes): {cognito_password}')
+                
+                if cognito_password is None:
+                    logger.error("Cognito password is None.")
+                    return Response({"error": "No password found."}, status=status.HTTP_400_BAD_REQUEST)
+
+                decoded_password = base64.b64decode(cognito_password).decode()  # Ensure proper decoding
+                logger.debug(f'decoded_password: {decoded_password}')
+
+                cognito_sign_in = cognito_client.sign_in(username, decoded_password)
+                if cognito_sign_in:
+                    user.cognito_password = None
+                    user.last_login = timezone.now()
+                    user.save()                    
+                    logger.debug(user.cognito_password)
+            except UnicodeDecodeError as decode_error:
+                logger.error(f"Password decoding failed: {decode_error}")
+                return Response({"error": "Invalid password format."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            except ClientError as e:
+                logger.error(f"Error signing in with Cognito: {str(e)}")
+                return Response({"error": f"Error signing in with Cognito: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+            # Prepare response data
+            response_data = {
+                'message': 'Account verified successfully.',
+                "branch": {
+                    "id": branch.id,
+                },
+                'cognito_confirm_otp': cognito_confirm_otp,
+                'cognito_sign_in': cognito_sign_in
+            }
+
+            return Response(response_data, status=status.HTTP_200_OK)
+
+            
+################################################### Login #############################################################
+
+class CeLoginView(APIView):
+    def post(self, request, format=None):
+        try:
+            username = request.data.get('username')
+            password = request.data.get('password')
+
+            # Check if username exists
+            try:
+                user = User.objects.get(username=username)
+            except User.DoesNotExist:
+                return Response({"message": "Invalid username"}, status=status.HTTP_401_UNAUTHORIZED)
+
+            # Check if the password is correct
+            user = authenticate(request, username=username, password=password)
+            
+            if user is not None:
+                if not user.is_cafe_entrepreneurship_user:
+                    return Response(
+                        {"message": "Access denied: Only food service users can log in."},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+
+                # Log in the user
+                login(request, user)
+                
+                refresh = RefreshToken.for_user(user)
+                custom_refresh(refresh, user)
+
+                response_data = {
+                    'refresh': str(refresh),
+                    'access': str(refresh.access_token),
+                    'message': 'Login successful'
+                }
+                return Response(response_data, status=status.HTTP_200_OK)
+            else:
+                return Response({"message": "Invalid password"}, status=status.HTTP_401_UNAUTHORIZED)
+
+        except Exception as e:
+            logger.exception(f"An error occurred during login: {str(e)}")
+            return Response(
+                {"message": "An error occurred during login", "error": str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+            
+        
+##################################################### ChangePassword #############################################################
+
+class CeChangePasswordView(APIView):
+    permission_classes = [IsAuthenticated, IsCafeEntrepreneurshipUser]
+
+    def post(self, request, *args, **kwargs):
+        user = request.user
+        serializer = ChangePasswordSerializer(data=request.data, context={'request': request})
+
+        if serializer.is_valid():
+            serializer.save()
+    
+            # Send confirmation email after password change
+            subject = 'Password Changed Successfully'
+            message = 'Your password has been changed successfully. If you did not request this change, please contact support immediately.'
+            send_custom_email([user.email], subject, message)
+            
+            return Response({"detail": "Password updated successfully."}, status=status.HTTP_200_OK)
+
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    
+##################################################### Profile Picture Update #############################################################
+
+class CeProfilePictureUpdateView(APIView):
+    permission_classes = [IsAuthenticated, IsCafeEntrepreneurshipUser]
+
+    def get_object(self):
+        user = self.request.user
+        return user.profile
+
+    def patch(self, request, *args, **kwargs):
+        profile = self.get_object()
+        serializer = ProfilePictureUpdateSerializer(profile, data=request.data, partial=True, context={'request': request})
+        
+        if serializer.is_valid():
+            serializer.save()
+            return Response({"detail": "Profile picture updated successfully.", "data": serializer.data}, status=status.HTTP_200_OK)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+################################################### User Delete #############################################################
+
+class CeUserDeleteView(APIView):
+    permission_classes = [IsAuthenticated, IsCafeEntrepreneurshipUser]
+    
+    def delete(self, request, format=None):
+        user = request.user
+        try:
+            # Send email before deletion
+            subject = 'Account Deleted'
+            message = 'Your account has been deleted.'
+            send_custom_email([user.email], subject, message)
+
+            user.delete()
+
+            return Response({'message': 'User deleted successfully.'}, status=status.HTTP_200_OK)
+        
+        except Exception as e:
+            logger.exception(f"Error occurred while deleting user: {str(e)}")
+            return Response({
+                'error': 'An error occurred while deleting the user.',
+                'details': str(e)
+            }, status=status.HTTP_400_BAD_REQUEST)
+            
+################################################### CeUserListView #############################################################        
+
+class CeUserListView(APIView):
+    permission_classes = [IsAuthenticated, IsCafeEntrepreneurshipUser]
+
+    def get(self, request, format=None):
+        try:
+            users = User.objects.filter(is_cafe_entrepreneurship_user=True, is_active=True)
+            user_list = []
+
+            for user in users:
+                user_data = {
+                    'id': user.id,
+                    'username': user.username,
+                    'email': user.email,
+                    'contact_number': user.contact_number,
+                }
+
+                # Check for specific user roles
+                if hasattr(user, 'is_trade_service_user') and user.is_trade_service_user:
+                    user_data['is_trade_service_user'] = user.is_trade_service_user
+                if hasattr(user, 'is_food_service_user') and user.is_food_service_user:
+                    user_data['is_food_service_user'] = user.is_food_service_user
+                if hasattr(user, 'is_cafe_entrepreneurship_user') and user.is_cafe_entrepreneurship_user:
+                    user_data['is_cafe_entrepreneurship_user'] = user.is_cafe_entrepreneurship_user
+
+                # Handle profile data if it exists
+                profile_data = None
+                if hasattr(user, 'profile'):
+                    profile = user.profile
+                    profile_data = {
+                        'first_name': profile.first_name,
+                        'last_name': profile.last_name,
+                        'state': profile.state.id,
+                        'post_code': profile.post_code,
+                        'image_url': profile.image.url if profile.image else None,
+                    }
+
+                user_list.append({
+                    'user': user_data,
+                    'profile': profile_data
+                })
+
+            return Response(user_list, status=status.HTTP_200_OK)
+        
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+################################################ Ce User ##############################################
+ 
+class CeUserGetEditView(APIView):
+    permission_classes = [IsAuthenticated, IsCafeEntrepreneurshipUser]
+
+    def get(self, request, format=None):
+        user = request.user
+        profile = user.profile
+        state = profile.state.id
+
+        data = {
+            "user_id": user.id,
+            "username": user.username,
+            "email": user.email,
+            "email_verify": user.email_verify,
+            "contact_number": user.contact_number,
+            "con_num_verify": user.con_num_verify,
+            "free_trial": user.free_trial,
+            "first_name" : profile.first_name,
+            "last_name" : profile.last_name,
+            "state" : state,
+            "post_code" : profile.post_code,
+            "image": profile.image.url if profile.image else None
+        }
+
+        return Response(data, status=status.HTTP_200_OK)
+
+    def patch(self, request, format=None):
+        user = request.user
+        profile = user.profile
+        data = request.data
+        errors = {}
+
+        # Update User model fields
+        if 'email' in data:
+            email = data['email']
+            try:
+                validate_email(email)
+                user.email = email
+            except ValidationError:
+                errors['email'] = 'Invalid email format.'
+
+            if User.objects.filter(email=email, is_active=True).exists():
+                errors['email'] = 'A user with this email already exists and is active.'
+
+        if 'contact_number' in data:
+            contact_number = data['contact_number']
+            if contact_number and len(contact_number) <= 15:
+                user.contact_number = contact_number
+            else:
+                errors['contact_number'] = "Phone number must be entered in the format: '+999999999'. Up to 15 digits allowed."
+
+        # Update UserProfile model fields
+        if 'image' in data:
+            profile.image = data['image']
+        
+        if 'first_name' in data:
+            profile.first_name = data['first_name']
+        
+        if 'last_name' in data:
+            profile.last_name = data['last_name']
+        
+        if 'state' in data:
+            profile.state_id = data['state']
+        
+        if 'post_code' in data:
+            profile.post_code = data['post_code']
+
+        # Save changes if there are no validation errors
+        if not errors:
+            user.save()
+            profile.save()
+
+            return Response({
+                'status': 'success',
+                'message': 'Profile and user details updated successfully',
+                'data': {
+                    'email': user.email,
+                    'contact_number': user.contact_number,
+                    'image': profile.image.url if profile.image else None,
+                    'first_name': profile.first_name,
+                    'last_name': profile.last_name,
+                    'state': profile.state_id,
+                    'post_code': profile.post_code,
+                }
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({
+                'status': 'error',
+                'message': 'failed',
+                'errors': errors
+            }, status=status.HTTP_400_BAD_REQUEST) 
+
+################################################ CeUserGetEditForStripeDataView ##############################################
+ 
+class CeUserGetEditForStripeDataView(APIView):
+    permission_classes = [IsAuthenticated, IsCafeEntrepreneurshipUser]
+
+    def get(self, request, format=None):
+        user = request.user
+
+        data = {
+            "user_id": user.id,
+            "username": user.username,
+            "email": user.email,
+            'stripe_customer_id': user.stripe_customer_id
+        }
+        return Response(data, status=status.HTTP_200_OK)
+
+    def patch(self, request, format=None):
+        user = request.user
+        data = request.data
+        errors = {}
+
+        if 'stripe_customer_id' in data:
+            # Check if the stripe_customer_id is already set and prevent changes
+            if user.stripe_customer_id:
+                errors['stripe_customer_id'] = 'Stripe customer ID is already set and cannot be changed.'
+            else:
+                stripe_customer_id = data['stripe_customer_id']
+                if not isinstance(stripe_customer_id, str) or not stripe_customer_id:
+                    errors['stripe_customer_id'] = 'Invalid Stripe customer ID.'
+                else:
+                    user.stripe_customer_id = stripe_customer_id
+
+        # Save changes if there are no validation errors
+        if not errors:
+            user.save()
+            return Response({
+                'status': 'success',
+                'message': 'Profile and user details updated successfully',
+                'data': {
+                    "user_id": user.id,
+                    'stripe_customer_id': user.stripe_customer_id,
+                }
+            }, status=status.HTTP_200_OK)
+        else:
+            return Response({
+                'status': 'error',
+                'message': 'Update failed due to validation errors',
+                'errors': errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+            
+            
+################################################################################################################################################           
+############################################################# Free Trial #######################################################################
+################################################################################################################################################
+
+class CeFreeTrialUserRegisterView(APIView):
+    def post(self, request, format=None):
+        try:
+            with transaction.atomic():
+                fields = ['username', 'email', 'contact_number', 'password', 'first_name', 'last_name', 'state', 'post_code', 'operational_status']
+                for field in fields:
+                    if field not in request.data:
+                        return Response({"error": f"Missing required field: {field}"}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                username = request.data.get('username')
+                email = request.data.get('email')
+                email2 = request.data.get('email2')
+                contact_number = request.data.get('contact_number')
+                password = request.data.get('password')
+                password2 = request.data.get('password2')
+                first_name = request.data.get('first_name')
+                last_name = request.data.get('last_name')
+                state = request.data.get('state')
+                post_code = request.data.get('post_code')
+                operational_status_ids = request.data.get('operational_status', [])
+                
+                is_valid, error_message = validate_list_ids(operational_status_ids, 'operational_status')
+        
+                if not is_valid:
+                    return Response({'error': error_message}, status=status.HTTP_400_BAD_REQUEST)
+                
+                expiration_time = timezone.now() - timedelta(hours=1)
+                User.objects.filter(is_verified=False, user_registered_at__lt=expiration_time).exclude(is_superuser=True).delete()
+                
+                if username:                    
+                    if User.objects.filter(username=username).exists():
+                        return Response({"error": "Username already exists"}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                if email != email2:
+                    return Response({"error": "Email addresses must match."}, status=status.HTTP_400_BAD_REQUEST)
+                
+                if password != password2:
+                    return Response({"error": "Passwords must match."}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                if email:                    
+                    if User.objects.filter(email=email).exists():
+                        return Response({"error": "Email already exists"}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                temp_username = f"{uuid.uuid4().hex[:8]}_{username}"
+                temp_email = f"{uuid.uuid4().hex[:8]}_{email}"
+
+                email_otp = str(random.randint(1000, 9999))
+                email_otp_created_at = timezone.now()
+                
+                one_month = timezone.now() + timedelta(days=30)
+
+                user = User.objects.create_user(
+                    username=temp_username,
+                    email=temp_email,
+                    contact_number=contact_number,
+                    password=password,
+                    email_otp=email_otp,
+                    email_otp_created_at=email_otp_created_at,
+                    is_cafe_entrepreneurship_user=True,
+                    free_trial='active',
+                    free_trial_ends_at=one_month
+                )
+
+                state_id = State.objects.get(id=state)
+                profile = UserProfile.objects.create(
+                    user=user,
+                    first_name=first_name,
+                    last_name=last_name,
+                    state=state_id,
+                    post_code=post_code
+                )
+                
+                # send otp email
+                subject = 'Your OTP Code'
+                html_message = render_to_string('emails/otp_email.html', {
+                    'otp_code': user.email_otp, 
+                    'first_name': profile.first_name, 
+                    'last_name': profile.last_name 
+                })
+                plain_message = f'Your OTP code is {user.email_otp}. It is valid for 10 minutes.'
+                
+                try:
+                    email_data = EmailMultiAlternatives(subject, plain_message, to=[email])
+                    email_data.attach_alternative(html_message, "text/html")
+                    email_data.send()
+                    logger.info(f'OTP email sent to {email}')
+                except Exception as e:
+                    logger.error(f'Error sending email: {e}')
+                    return Response({'error': 'Failed to send OTP email.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                
+                return Response({
+                    'user': {
+                        'id': user.id,
+                        'username': username,
+                        'email': email,
+                        'contact_number': user.contact_number,
+                    },
+                    'profile': {
+                        'first_name': profile.first_name,
+                        'last_name': profile.last_name,
+                        'state': str(profile.state),
+                        'post_code': profile.post_code,
+                    },
+                    'branch': {
+                        'operational_status':  operational_status_ids,
+                    }
+                }, status=status.HTTP_201_CREATED)
+
+        except KeyError as key_error:
+            logger.error(f"Missing required field: {key_error}")
+            return Response({"error": f"Missing required field: {key_error}"}, status=status.HTTP_400_BAD_REQUEST)
+        except IntegrityError as integrity_error:
+            logger.error(f"Database integrity error: {integrity_error}")
+            return Response({"error": f"Database integrity error: {integrity_error}"}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred: {e}")
+            return Response({"error": f"An unexpected error occurred: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class CeFreeTrialVerifyEmailOTPView(APIView):
+    def patch(self, request, user_id=None, format=None):
+        with transaction.atomic():
+            fields = ['otp', 'operational_status',]
+            for field in fields:
+                if field not in request.data:
+                    return Response({"error": f"Missing required field: {field}"}, status=status.HTTP_400_BAD_REQUEST)
+                    
+            otp = request.data.get('otp')
+            operational_status_ids = request.data.get('operational_status', [])
+            
+            try:
+                user = User.objects.get(id=user_id)
+            except User.DoesNotExist:
+                return Response({'error': 'User does not exist.'}, status=status.HTTP_404_NOT_FOUND)
+            
+            if not user.is_cafe_entrepreneurship_user:
+                return Response({"error": "This user does not have permission to access this process."}, status=status.HTTP_400_BAD_REQUEST)
+            
+            if user.email_otp == otp:
+                time_elapsed = timezone.now() - user.email_otp_created_at
+                if time_elapsed <= timedelta(minutes=10):
+                    
+                    # Prepare to strip temporary username and email
+                    remove_temp_username = user.username.split("_", 1)[-1]
+                    remove_temp_email = user.email.split("_", 1)[-1]
+                    
+                    # Validate if the username or email already exists
+                    if User.objects.filter(username=remove_temp_username).exists():
+                        return Response({"error": "The username was taken by someone else before you. Please choose a different one."}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                    if User.objects.filter(email=remove_temp_email).exists():
+                        return Response({"error": "The email is already verified. Please check your email security settings."}, status=status.HTTP_400_BAD_REQUEST)
+                    
+                    try:
+                        # Update the user with verified details
+                        user.username = remove_temp_username
+                        user.email = remove_temp_email                  
+                        user.is_active = True
+                        user.email_otp = None
+                        user.email_otp_created_at = None
+                        user.email_verify = True
+                        user.is_verified = True
+                        user.save()
+                        
+                    except Exception as e:
+                        logger.error(f"Error updating user {user_id}: {str(e)}")
+                        return Response({'error': f'Error updating user: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                    
+                    # Generate refresh and access tokens
+                    refresh = RefreshToken.for_user(user)
+                    custom_refresh(refresh, user)
+                    
+                    try:
+                        # Create CeBranch for the user
+                        branch = CeBranch.objects.create(
+                            user=user,
+                            subscription_type='pro',
+                            subscription_status='free_trial'
+                        )
+                        
+                        # Set operational status if provided
+                        if operational_status_ids:
+                            branch.operational_status.set(operational_status_ids)
+
+                    except ValidationError as ve:
+                        logger.error(f"Validation error for branch creation: {ve}")
+                        return Response({'error': f'Invalid operational status IDs: {ve}'}, status=status.HTTP_400_BAD_REQUEST)
+
+                    # Log email notification creation
+                    CeEmailNotificationStatus.objects.create(user=user)
+                    
+                    # Send confirmation email
+                    subject = 'Account Created Successfully'
+                    message = 'Your account has been created successfully.'
+                    send_custom_email([user.email], subject, message)
+                    
+                    response_data = {
+                        'message': 'Account verified successfully.',
+                        'refresh': str(refresh),
+                        'access': str(refresh.access_token),
+                        "branch": {
+                            "id": branch.id,
+                        }
+                    }
+                    
+                    return Response(response_data, status=status.HTTP_200_OK)
+                else:
+                    return Response({'error': 'OTP has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                return Response({'error': 'Invalid OTP or user ID.'}, status=status.HTTP_400_BAD_REQUEST)
+
+
+
+
+################################################################################################################################################################################
