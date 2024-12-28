@@ -1,0 +1,9 @@
+netsh wlan show profiles
+netsh wlan show profile name="YourNetworkName" key=clear
+
+
+mac
+security find-generic-password -ga "YourNetworkName" | grep "password"
+
+linux
+sudo grep psk= /etc/NetworkManager/system-connections/*
